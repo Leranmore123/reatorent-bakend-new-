@@ -493,9 +493,8 @@ class DashboardView(APIView):
     def get(self, request):
         today = timezone.now().date()
 
-        # Today's paid bills
+        # Today's bills (both BILLED and PAID)
         today_bills = Bill.objects.filter(
-            is_paid=True,
             created_at__date=today,
         )
         today_sales = today_bills.aggregate(total=Sum('total_amount'))['total'] or Decimal('0')
