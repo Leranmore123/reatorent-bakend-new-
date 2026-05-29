@@ -358,7 +358,7 @@ class BillViewSet(viewsets.ModelViewSet):
         .all()
     )
     serializer_class = BillSerializer
-    http_method_names = ['get', 'put', 'patch', 'head', 'options']
+    http_method_names = ['get', 'put', 'patch', 'delete', 'head', 'options']
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['bill_number', 'order__table__name', 'payment_mode']
     ordering_fields = ['created_at', 'total_amount']
@@ -434,6 +434,16 @@ class BillViewSet(viewsets.ModelViewSet):
             bill.order.save(update_fields=['status', 'updated_at'])
 
         return Response(serializer.data)
+
+    def destroy(self, request, *args, **kwargs):
+        """Delete a bill and reset the associated order status to PENDING."""
+        bill = self.get_object()
+        order = bill.order
+        bill.delete()
+        # Reset order so it can be re-billed
+        order.status = Order.Status.PENDING
+        order.save(update_fields=['status', 'updated_at'])
+        return Response({'detail': 'Bill deleted. Order reset to pending.'}, status=status.HTTP_200_OK)
 
 
 # ---------------------------------------------------------------------------
@@ -521,6 +531,391 @@ class DashboardView(APIView):
             'active_orders': active_order_count,
             'status_breakdown': list(status_breakdown),
             'recent_orders': recent_orders_data,
+        })
+
+
+# ---------------------------------------------------------------------------
+# Item Sales Report
+# ---------------------------------------------------------------------------
+
+class ItemSalesReportView(APIView):
+    """
+    GET /api/reports/item-sales/?date=today|YYYY-MM-DD&month=YYYY-MM
+    Item-wise sales — quantity sold and total amount per item.
+    """
+
+    def get(self, request):
+        from django.db.models import Sum, F
+        import datetime
+
+        month_param = request.query_params.get('month')
+        date_param  = request.query_params.get('date', 'today')
+
+        if month_param:
+            # Monthly item report
+            try:
+                year, month = map(int, month_param.split('-'))
+            except Exception:
+                today = timezone.now().date()
+                year, month = today.year, today.month
+            paid_orders = Order.objects.filter(
+                status__in=[Order.Status.PAID, Order.Status.BILLED],
+                updated_at__year=year,
+                updated_at__month=month,
+            )
+            label = f'{datetime.date(year, month, 1).strftime("%B %Y")}'
+        else:
+            if date_param == 'today':
+                target_date = timezone.now().date()
+            else:
+                try:
+                    target_date = datetime.date.fromisoformat(date_param)
+                except ValueError:
+                    target_date = timezone.now().date()
+            paid_orders = Order.objects.filter(
+                status__in=[Order.Status.PAID, Order.Status.BILLED],
+                updated_at__date=target_date,
+            )
+            label = str(target_date)
+
+        item_sales = (
+            OrderItem.objects.filter(order__in=paid_orders)
+            .values('menu_item__id', 'menu_item__name', 'menu_item__category__name')
+            .annotate(
+                total_qty=Sum('quantity'),
+                total_amount=Sum(F('quantity') * F('price')),
+            )
+            .order_by('-total_qty')
+        )
+
+        result = []
+        grand_qty    = 0
+        grand_amount = Decimal('0')
+        for row in item_sales:
+            qty    = row['total_qty'] or 0
+            amount = row['total_amount'] or Decimal('0')
+            grand_qty    += qty
+            grand_amount += amount
+            result.append({
+                'item_id':      row['menu_item__id'],
+                'item_name':    row['menu_item__name'],
+                'category':     row['menu_item__category__name'] or 'Uncategorized',
+                'quantity':     qty,
+                'total_amount': str(amount.quantize(Decimal('0.01'))),
+            })
+
+        return Response({
+            'period':              label,
+            'items':               result,
+            'grand_total_qty':     grand_qty,
+            'grand_total_amount':  str(grand_amount.quantize(Decimal('0.01'))),
+        })
+
+
+# ---------------------------------------------------------------------------
+# Daily Sales Report
+# ---------------------------------------------------------------------------
+
+class DailySalesReportView(APIView):
+    """
+    GET /api/reports/daily/?date=YYYY-MM-DD  (default: today)
+    Full daily sales breakdown.
+    """
+
+    def get(self, request):
+        import datetime
+        date_param = request.query_params.get('date', 'today')
+        if date_param == 'today':
+            target_date = timezone.now().date()
+        else:
+            try:
+                target_date = datetime.date.fromisoformat(date_param)
+            except ValueError:
+                target_date = timezone.now().date()
+
+        bills = Bill.objects.filter(created_at__date=target_date).select_related('order__table')
+
+        total_sales    = bills.aggregate(t=Sum('total_amount'))['t'] or Decimal('0')
+        total_discount = bills.aggregate(t=Sum('discount'))['t']     or Decimal('0')
+        total_tax      = bills.aggregate(t=Sum('tax_amount'))['t']   or Decimal('0')
+        total_bills    = bills.count()
+
+        payment_breakdown = []
+        for mode_key, mode_label in Bill.PaymentMode.choices:
+            mb = bills.filter(payment_mode=mode_key)
+            mt = mb.aggregate(t=Sum('total_amount'))['t'] or Decimal('0')
+            mc = mb.count()
+            if mc > 0:
+                payment_breakdown.append({
+                    'mode': mode_key, 'label': mode_label,
+                    'count': mc, 'total': str(mt.quantize(Decimal('0.01'))),
+                })
+
+        from .serializers import BillSerializer
+        bills_data = BillSerializer(bills.order_by('-created_at'), many=True).data
+
+        return Response({
+            'date':              str(target_date),
+            'total_sales':       str(total_sales.quantize(Decimal('0.01'))),
+            'total_bills':       total_bills,
+            'total_discount':    str(total_discount.quantize(Decimal('0.01'))),
+            'total_tax':         str(total_tax.quantize(Decimal('0.01'))),
+            'payment_breakdown': payment_breakdown,
+            'bills':             bills_data,
+        })
+
+
+# ---------------------------------------------------------------------------
+# Monthly Sales Report
+# ---------------------------------------------------------------------------
+
+class MonthlySalesReportView(APIView):
+    """
+    GET /api/reports/monthly/?month=YYYY-MM  (default: current month)
+    Monthly sales with day-wise breakdown.
+    """
+
+    def get(self, request):
+        import datetime, calendar
+        month_param = request.query_params.get('month')
+        today = timezone.now().date()
+        if month_param:
+            try:
+                year, month = map(int, month_param.split('-'))
+            except Exception:
+                year, month = today.year, today.month
+        else:
+            year, month = today.year, today.month
+
+        bills = Bill.objects.filter(
+            created_at__year=year, created_at__month=month
+        ).select_related('order__table')
+
+        from django.db.models.functions import TruncDate
+
+        total_sales    = bills.aggregate(t=Sum('total_amount'))['t'] or Decimal('0')
+        total_discount = bills.aggregate(t=Sum('discount'))['t']     or Decimal('0')
+        total_tax      = bills.aggregate(t=Sum('tax_amount'))['t']   or Decimal('0')
+        total_bills    = bills.count()
+
+        # Day-wise breakdown
+        daily = (
+            bills.annotate(day=TruncDate('created_at'))
+            .values('day')
+            .annotate(sales=Sum('total_amount'), count=Count('id'))
+            .order_by('day')
+        )
+        daily_data = [
+            {
+                'date':  str(row['day']),
+                'sales': str((row['sales'] or Decimal('0')).quantize(Decimal('0.01'))),
+                'bills': row['count'],
+            }
+            for row in daily
+        ]
+
+        # Payment breakdown
+        payment_breakdown = []
+        for mode_key, mode_label in Bill.PaymentMode.choices:
+            mb = bills.filter(payment_mode=mode_key)
+            mt = mb.aggregate(t=Sum('total_amount'))['t'] or Decimal('0')
+            mc = mb.count()
+            if mc > 0:
+                payment_breakdown.append({
+                    'mode': mode_key, 'label': mode_label,
+                    'count': mc, 'total': str(mt.quantize(Decimal('0.01'))),
+                })
+
+        month_label = datetime.date(year, month, 1).strftime('%B %Y')
+        days_in_month = calendar.monthrange(year, month)[1]
+
+        return Response({
+            'month':             month_label,
+            'year':              year,
+            'month_num':         month,
+            'days_in_month':     days_in_month,
+            'total_sales':       str(total_sales.quantize(Decimal('0.01'))),
+            'total_bills':       total_bills,
+            'total_discount':    str(total_discount.quantize(Decimal('0.01'))),
+            'total_tax':         str(total_tax.quantize(Decimal('0.01'))),
+            'avg_daily_sales':   str((total_sales / days_in_month).quantize(Decimal('0.01'))) if days_in_month else '0',
+            'payment_breakdown': payment_breakdown,
+            'daily_breakdown':   daily_data,
+        })
+
+
+# ---------------------------------------------------------------------------
+# Profit & Loss Report
+# ---------------------------------------------------------------------------
+
+class ProfitLossReportView(APIView):
+    """
+    GET /api/reports/profit-loss/?month=YYYY-MM or ?date=YYYY-MM-DD
+    P&L based on selling price vs cost_price of menu items.
+    """
+
+    def get(self, request):
+        import datetime
+        month_param = request.query_params.get('month')
+        date_param  = request.query_params.get('date')
+        today = timezone.now().date()
+
+        if date_param:
+            try:
+                target_date = datetime.date.fromisoformat(date_param)
+            except ValueError:
+                target_date = today
+            paid_orders = Order.objects.filter(
+                status__in=[Order.Status.PAID, Order.Status.BILLED],
+                updated_at__date=target_date,
+            )
+            period_label = str(target_date)
+            period_type  = 'daily'
+        elif month_param:
+            try:
+                year, month = map(int, month_param.split('-'))
+            except Exception:
+                year, month = today.year, today.month
+            paid_orders = Order.objects.filter(
+                status__in=[Order.Status.PAID, Order.Status.BILLED],
+                updated_at__year=year,
+                updated_at__month=month,
+            )
+            period_label = datetime.date(year, month, 1).strftime('%B %Y')
+            period_type  = 'monthly'
+        else:
+            paid_orders = Order.objects.filter(
+                status__in=[Order.Status.PAID, Order.Status.BILLED],
+                updated_at__date=today,
+            )
+            period_label = str(today)
+            period_type  = 'daily'
+
+        # Revenue = sum of (qty * selling_price) from order items
+        order_items = OrderItem.objects.filter(order__in=paid_orders).select_related('menu_item')
+
+        total_revenue = Decimal('0')
+        total_cost    = Decimal('0')
+        item_pl       = {}
+
+        for oi in order_items:
+            revenue = oi.quantity * oi.price
+            cost    = oi.quantity * (oi.menu_item.cost_price or Decimal('0'))
+            total_revenue += revenue
+            total_cost    += cost
+
+            mid = oi.menu_item.id
+            if mid not in item_pl:
+                item_pl[mid] = {
+                    'item_id':   mid,
+                    'item_name': oi.menu_item.name,
+                    'qty':       0,
+                    'revenue':   Decimal('0'),
+                    'cost':      Decimal('0'),
+                    'profit':    Decimal('0'),
+                }
+            item_pl[mid]['qty']     += oi.quantity
+            item_pl[mid]['revenue'] += revenue
+            item_pl[mid]['cost']    += cost
+            item_pl[mid]['profit']  += (revenue - cost)
+
+        # Bills for discount/tax
+        bills = Bill.objects.filter(order__in=paid_orders)
+        total_discount = bills.aggregate(t=Sum('discount'))['t']   or Decimal('0')
+        total_tax      = bills.aggregate(t=Sum('tax_amount'))['t'] or Decimal('0')
+
+        gross_profit = total_revenue - total_cost
+        net_profit   = gross_profit - total_discount  # tax is already in revenue
+
+        item_list = sorted(item_pl.values(), key=lambda x: x['profit'], reverse=True)
+        for i in item_list:
+            i['revenue'] = str(i['revenue'].quantize(Decimal('0.01')))
+            i['cost']    = str(i['cost'].quantize(Decimal('0.01')))
+            i['profit']  = str(i['profit'].quantize(Decimal('0.01')))
+
+        margin = (gross_profit / total_revenue * 100) if total_revenue > 0 else Decimal('0')
+
+        return Response({
+            'period':         period_label,
+            'period_type':    period_type,
+            'total_revenue':  str(total_revenue.quantize(Decimal('0.01'))),
+            'total_cost':     str(total_cost.quantize(Decimal('0.01'))),
+            'total_discount': str(total_discount.quantize(Decimal('0.01'))),
+            'total_tax':      str(total_tax.quantize(Decimal('0.01'))),
+            'gross_profit':   str(gross_profit.quantize(Decimal('0.01'))),
+            'net_profit':     str(net_profit.quantize(Decimal('0.01'))),
+            'profit_margin':  str(margin.quantize(Decimal('0.01'))),
+            'items':          item_list,
+        })
+
+
+# ---------------------------------------------------------------------------
+# Item Sales Report (legacy — kept for backward compat)
+# ---------------------------------------------------------------------------
+
+class ItemSalesReportView(APIView):
+    """
+    GET /api/reports/item-sales/?date=today
+    Returns today's item-wise sales report — quantity sold and total amount per item.
+    """
+
+    def get(self, request):
+        from django.utils import timezone
+        from django.db.models import Sum, F
+
+        date_param = request.query_params.get('date', 'today')
+        if date_param == 'today':
+            target_date = timezone.now().date()
+        else:
+            try:
+                from datetime import date
+                target_date = date.fromisoformat(date_param)
+            except ValueError:
+                target_date = timezone.now().date()
+
+        # Only count items from PAID or BILLED orders
+        paid_orders = Order.objects.filter(
+            status__in=[Order.Status.PAID, Order.Status.BILLED],
+            updated_at__date=target_date,
+        )
+
+        # Aggregate by menu item
+        item_sales = (
+            OrderItem.objects.filter(order__in=paid_orders)
+            .values(
+                'menu_item__id',
+                'menu_item__name',
+                'menu_item__category__name',
+            )
+            .annotate(
+                total_qty=Sum('quantity'),
+                total_amount=Sum(F('quantity') * F('price')),
+            )
+            .order_by('-total_qty')
+        )
+
+        result = []
+        grand_qty = 0
+        grand_amount = Decimal('0')
+
+        for row in item_sales:
+            qty = row['total_qty'] or 0
+            amount = row['total_amount'] or Decimal('0')
+            grand_qty += qty
+            grand_amount += amount
+            result.append({
+                'item_id': row['menu_item__id'],
+                'item_name': row['menu_item__name'],
+                'category': row['menu_item__category__name'] or 'Uncategorized',
+                'quantity': qty,
+                'total_amount': str(amount.quantize(Decimal('0.01'))),
+            })
+
+        return Response({
+            'date': str(target_date),
+            'items': result,
+            'grand_total_qty': grand_qty,
+            'grand_total_amount': str(grand_amount.quantize(Decimal('0.01'))),
         })
 
 

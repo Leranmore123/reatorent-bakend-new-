@@ -13,6 +13,10 @@ from .views import (
     KOTViewSet,
     DashboardView,
     ClearDataView,
+    ItemSalesReportView,
+    DailySalesReportView,
+    MonthlySalesReportView,
+    ProfitLossReportView,
 )
 
 router = DefaultRouter()
@@ -28,4 +32,8 @@ urlpatterns = [
     path('', include(router.urls)),
     path('dashboard/', DashboardView.as_view(), name='dashboard'),
     path('clear-data/', ClearDataView.as_view(), name='clear-data'),
+    path('reports/item-sales/', ItemSalesReportView.as_view(), name='item-sales-report'),
+    path('reports/daily/', DailySalesReportView.as_view(), name='daily-report'),
+    path('reports/monthly/', MonthlySalesReportView.as_view(), name='monthly-report'),
+    path('reports/profit-loss/', ProfitLossReportView.as_view(), name='profit-loss'),
 ]
