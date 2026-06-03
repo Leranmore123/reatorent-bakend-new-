@@ -436,14 +436,14 @@ class BillViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
     def destroy(self, request, *args, **kwargs):
-        """Delete a bill and reset the associated order status to PENDING."""
+        """Delete a bill and reset the associated order status to CANCELLED so table is freed."""
         bill = self.get_object()
         order = bill.order
         bill.delete()
-        # Reset order so it can be re-billed
-        order.status = Order.Status.PENDING
+        # Set order to CANCELLED so table becomes free
+        order.status = Order.Status.CANCELLED
         order.save(update_fields=['status', 'updated_at'])
-        return Response({'detail': 'Bill deleted. Order reset to pending.'}, status=status.HTTP_200_OK)
+        return Response({'detail': 'Bill deleted. Order cancelled and table freed.'}, status=status.HTTP_200_OK)
 
 
 # ---------------------------------------------------------------------------
