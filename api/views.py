@@ -439,10 +439,19 @@ class BillViewSet(viewsets.ModelViewSet):
         """Delete a bill and reset the associated order status to CANCELLED so table is freed."""
         bill = self.get_object()
         order = bill.order
+        table = order.table  # save reference before bill delete
         bill.delete()
         # Set order to CANCELLED so table becomes free
         order.status = Order.Status.CANCELLED
-        order.save(update_fields=['status', 'updated_at'])
+        order.save()  # full save triggers table.is_occupied logic in model
+        # Also directly free the table if no other active orders
+        if table:
+            active_orders = Order.objects.filter(
+                table=table,
+                status__in=[Order.Status.PENDING, Order.Status.HOLD, Order.Status.KOT]
+            ).exclude(pk=order.pk)
+            table.is_occupied = active_orders.exists()
+            table.save(update_fields=['is_occupied'])
         return Response({'detail': 'Bill deleted. Order cancelled and table freed.'}, status=status.HTTP_200_OK)
 
 
