@@ -46,12 +46,14 @@ class TableSerializer(serializers.ModelSerializer):
     active_order_total = serializers.SerializerMethodField()
     active_order_status = serializers.SerializerMethodField()
     active_order_item_count = serializers.SerializerMethodField()
+    active_order_created_at = serializers.SerializerMethodField()
 
     class Meta:
         model = Table
         fields = ['id', 'name', 'capacity', 'is_occupied',
                   'active_order_id', 'active_order_total',
-                  'active_order_status', 'active_order_item_count', 'created_at']
+                  'active_order_status', 'active_order_item_count',
+                  'active_order_created_at', 'created_at']
         read_only_fields = ['id', 'is_occupied', 'created_at']
 
     def _get_active_order(self, obj):
@@ -79,6 +81,10 @@ class TableSerializer(serializers.ModelSerializer):
         if not order:
             return 0
         return sum(item.quantity for item in order.items.all())
+
+    def get_active_order_created_at(self, obj):
+        order = self._get_active_order(obj)
+        return order.created_at.isoformat() if order else None
 
 
 # ---------------------------------------------------------------------------
