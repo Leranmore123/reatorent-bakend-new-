@@ -217,7 +217,8 @@ class BillSerializer(serializers.ModelSerializer):
 
     def validate(self, data):
         amount_received = data.get('amount_received', Decimal('0'))
-        total_amount = self.instance.total_amount if self.instance else data.get('total_amount', Decimal('0'))
+        # total_amount is read_only, always use instance value
+        total_amount = self.instance.total_amount if self.instance else Decimal('0')
         if data.get('is_paid') and amount_received < total_amount:
             raise serializers.ValidationError(
                 'Amount received cannot be less than total amount when marking as paid.'
